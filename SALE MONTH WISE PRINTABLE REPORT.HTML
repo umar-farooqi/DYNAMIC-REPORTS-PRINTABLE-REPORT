@@ -1,0 +1,261 @@
+DECLARE
+    v_start_date  DATE        := DATE '2025-07-01';
+    v_end_date    DATE        := TRUNC(LAST_DAY(SYSDATE));
+    v_mo_count    PLS_INTEGER;
+    v_mo_date     DATE;
+
+    -- Simple typed arrays
+    TYPE arr_vc  IS TABLE OF VARCHAR2(500) INDEX BY PLS_INTEGER;
+    TYPE arr_num IS TABLE OF NUMBER        INDEX BY PLS_INTEGER;
+
+    a_uid   arr_vc;   -- officer user_id
+    a_name  arr_vc;   -- officer name
+    a_total arr_num;  -- officer grand total
+    -- Flat bag matrix: officer_idx * 200 + month_idx
+    a_bags  arr_num;
+    a_motot arr_num;  -- monthly grand totals
+
+    v_oi    PLS_INTEGER;
+    v_mi    PLS_INTEGER;
+    v_omax  PLS_INTEGER := 0;
+    v_gtot  NUMBER      := 0;
+    V_BAGS_TYPE   VARCHAR2(100);
+    V_ITEM_NAME   VARCHAR2(100);
+BEGIN
+    
+    BEGIN
+        SELECT 
+                ITM.ITEM_NAME || ' ' || ITM.PACKING_SIZE || '('||  ITM.UNIT ||') '|| PACKING AS PRODUCT_NAME
+                INTO V_ITEM_NAME
+                
+        FROM   
+                            AB_ITEMS_MASTER ITM
+        WHERE
+                   ITM.ITEM_ID = :P1136_ITEM_NAME
+                   AND ROWNUM = 1;
+        EXCEPTION WHEN NO_DATA_FOUND 
+                  THEN V_ITEM_NAME := NULL;
+    END;
+
+BEGIN
+    IF :P1136_BAGS_TYPE IS NULL THEN
+        V_BAGS_TYPE := 'All Type (Normal Sale Order, Advance Sale Order, Trading Sale)';
+
+     ELSIF INSTR(:P1136_BAGS_TYPE, 'SALE ORDER') > 0 
+       AND INSTR(:P1136_BAGS_TYPE, 'ASO') > 0 
+       AND INSTR(:P1136_BAGS_TYPE, '645') > 0 THEN
+        V_BAGS_TYPE := 'All Type (Normal Sale Order, Advance Sale Order, Trading Sale)';
+        
+    ELSIF INSTR(:P1136_BAGS_TYPE, 'SALE ORDER') > 0 
+       AND INSTR(:P1136_BAGS_TYPE, 'ASO') > 0 THEN
+        V_BAGS_TYPE := 'Normal Sale Order, Advance Sale Order';
+        
+    ELSIF INSTR(:P1136_BAGS_TYPE, 'SALE ORDER') > 0 
+       AND INSTR(:P1136_BAGS_TYPE, '645') > 0 THEN
+        V_BAGS_TYPE := 'Normal Sale Order, Trading Sale';
+        
+    ELSIF INSTR(:P1136_BAGS_TYPE, 'ASO') > 0 
+       AND INSTR(:P1136_BAGS_TYPE, '645') > 0 THEN
+        V_BAGS_TYPE := 'Advance Sale Order, Trading Sale';
+        
+    ELSIF :P1136_BAGS_TYPE = 'SALE ORDER' THEN
+        V_BAGS_TYPE := 'Normal Sale Order';
+        
+    ELSIF :P1136_BAGS_TYPE = 'ASO' THEN
+        V_BAGS_TYPE := 'Advance Sale Order';
+        
+    ELSIF :P1136_BAGS_TYPE = '645' THEN
+        V_BAGS_TYPE := 'Trading Sale';
+        
+    ELSE
+        V_BAGS_TYPE := 'All Type (Normal Sale Order, Advance Sale Order, Trading Sale)';
+    END IF;
+END;
+
+
+    v_mo_count := MONTHS_BETWEEN(
+                      TRUNC(v_end_date,   'MM'),
+                      TRUNC(v_start_date, 'MM')
+                  ) + 1;
+
+    -- Init monthly grand-total slots
+    FOR i IN 0 .. v_mo_count - 1 LOOP
+        a_motot(i) := 0;
+    END LOOP;
+
+    -- ── Single query: one row per (officer, month) ──────────────────────────
+    FOR r IN (
+         WITH 
+          PRODUCT_NAME AS (
+          SELECT 
+                
+                ITM.ITEM_NAME || ' ' || ITM.PACKING_SIZE || '('||  ITM.UNIT ||') '|| PACKING AS PRODUCT_NAME,
+                ITEM_ID
+        FROM   
+                            AB_ITEMS_MASTER ITM
+        WHERE
+                   ITM.STATUS='Y'
+      ORDER BY
+                    ITM.ITEM_ID ASC
+
+
+       )
+        SELECT TO_CHAR(UM.USER_ID)  u_id,
+               MAX(UM.USER_NAME)    u_name,
+               MONTHS_BETWEEN(
+                   TRUNC(SO.ORDER_DATE, 'MM'),
+                   TRUNC(v_start_date,  'MM')
+               )                    m_idx,
+               ROUND(SUM(NVL(SOD.NO_BAGS, 0) + NVL(POD.CHANGE_BAGS, 0))) bags
+        FROM   AB_SO_ORDER_HEAD             SO
+        JOIN   AB_SO_ORDER_DET              SOD ON SOD.SO_ID  = SO.SO_ID
+        JOIN   AB_UM_APPLICATION_USERS      UM  ON UM.USER_ID = SO.SALE_OFFER_ID
+        LEFT JOIN AB_PO_PURCHASE_ORDER      PO  ON PO.PO_ID   = SO.SO_IDS
+        LEFT JOIN AB_PO_PURCHASE_ORDER_DET  POD ON POD.PO_ID  = PO.PO_ID
+                                                AND POD.DET_TYPE = '642'
+        LEFT JOIN PRODUCT_NAME PN  ON PN.ITEM_ID = SOD.ITEM_ID
+        WHERE  SO.SO_TYPE IN ('SALE ORDER', 'ASO', '645')
+          AND  SO.ORG_ID  = :GV_ORG_ID
+          AND  SO.STATUS  = 'Y'
+          AND  SOD.STATUS = 'Y'
+          --AND UM.USER_ID NOT IN (74, 70, 49)
+          AND  SO.ORDER_DATE BETWEEN v_start_date AND v_end_date
+          AND  (   SO.SO_TYPE IN (
+                       SELECT REGEXP_SUBSTR(:P1136_BAGS_TYPE, '[^:]+', 1, LEVEL)
+                       FROM   dual
+                       CONNECT BY REGEXP_SUBSTR(:P1136_BAGS_TYPE, '[^:]+', 1, LEVEL) IS NOT NULL
+                   )
+                OR :P1136_BAGS_TYPE IS NULL
+               )
+        AND PN.ITEM_ID = NVL(:P1136_ITEM_NAME,PN.ITEM_ID) 
+        GROUP BY TO_CHAR(UM.USER_ID), TRUNC(SO.ORDER_DATE, 'MM')
+        ORDER BY MAX(UM.USER_NAME)
+    ) LOOP
+        v_mi := r.m_idx;
+
+        -- Find existing officer slot, or create new one
+        v_oi := NULL;
+        IF a_uid.COUNT > 0 THEN
+            FOR k IN a_uid.FIRST .. a_uid.LAST LOOP
+                IF a_uid(k) = r.u_id THEN v_oi := k; EXIT; END IF;
+            END LOOP;
+        END IF;
+
+        IF v_oi IS NULL THEN
+            v_oi         := v_omax;
+            a_uid(v_oi)  := r.u_id;
+            a_name(v_oi) := r.u_name;
+            a_total(v_oi):= 0;
+            -- Pre-init all month cells for this officer
+            FOR m IN 0 .. v_mo_count - 1 LOOP
+                a_bags(v_oi * 200 + m) := 0;
+            END LOOP;
+            v_omax := v_omax + 1;
+        END IF;
+
+        a_bags(v_oi * 200 + v_mi) := r.bags;
+        a_total(v_oi) := NVL(a_total(v_oi), 0) + r.bags;
+        a_motot(v_mi) := NVL(a_motot(v_mi), 0) + r.bags;
+        v_gtot        := v_gtot + r.bags;
+    END LOOP;
+
+    -- ── Print JS ────────────────────────────────────────────────────────────
+    htp.p('<script>
+        function printDiv(printpage) {
+            var headstr  = "<html><head><title></title><style>";
+            headstr += "@page { size: legal landscape; margin: 10mm; }";
+            headstr += "td, H4 { -webkit-print-color-adjust: exact !important; print-color-adjust: exact !important; }";
+            headstr += "body  { margin: 0; padding: 0; font-family: Arial, sans-serif; }";
+            headstr += "thead { display: table-header-group; }";
+            headstr += "tfoot { display: table-footer-group; }";
+            headstr += "table { border-collapse: collapse; width: 100%; table-layout: fixed; }";
+            headstr += "th, td { font-size: 11px; text-align: center; border: 1px solid #999; padding: 3px; word-wrap: break-word; }";
+            headstr += "th { background-color: #B4C6E7; -webkit-print-color-adjust: exact; print-color-adjust: exact; }";
+            headstr += "td.name-col { text-align: left; }";
+            headstr += "td.number-col { text-align: right; }";  /* Added for right alignment */
+            headstr += "tr.total-row td { background-color: #E2EFDA; font-weight: bold; -webkit-print-color-adjust: exact; print-color-adjust: exact; }";
+            headstr += "h3 { color: white; margin: 0; text-align: center; background-color: #1F3864; border: 1px solid black; -webkit-print-color-adjust: exact; print-color-adjust: exact; padding: 5px; }";
+            headstr += "</style></head><body>";
+            var footstr = "</body></html>";
+            var newstr  = document.getElementById(printpage).innerHTML;
+            document.body.innerHTML = headstr + newstr + footstr;
+            window.print();
+            location.reload();
+        }
+    </script>');
+
+    htp.p('<button class="button" onclick="printDiv(''all_reports'')">Print Report</button>');
+
+    -- ── Report container ─────────────────────────────────────────────────────
+    htp.p('<div id="all_reports">');
+    htp.p('<h3>Sales Bags Report &mdash; '
+          || TO_CHAR(v_start_date, 'MON-YYYY')
+          || ' to '
+          || TO_CHAR(v_end_date, 'MON-YYYY')
+          || '</h3>');
+
+    htp.p('<table border="1" cellpadding="3" cellspacing="0">');
+
+      htp.p('<div style="font-family: Arial, sans-serif; font-size: 13px; padding: 6px; display: flex; justify-content: space-between; align-items: center; width: 100%;">
+          <span style="text-align: left;"><b>Bag Type:-  </b> <b>' || V_BAGS_TYPE || '</b></span>
+          <span style="text-align: left;"><b>Product Name:-  </b> <b>' || V_ITEM_NAME || '</b></span>
+          <span style="text-align: right; margin-right: 40px;"><b>Print By:</b> '|| :APP_USER ||'</span>
+       </div>');
+
+    -- ── THEAD ────────────────────────────────────────────────────────────────
+    htp.p('<thead><tr>');
+    htp.p('<th style="background:#1F3864;color:white;text-align:LEFT;">SALE OFFICER</th>');
+    htp.p('<th style="background:#1F3864;color:white;">TOTAL BAGS</th>');
+
+    -- FOR loop: one <th> per month in REVERSE ORDER
+    FOR i IN REVERSE 0 .. v_mo_count - 1 LOOP
+        v_mo_date := ADD_MONTHS(v_start_date, i);
+        htp.p('<th style="background:#1F3864;color:white;text-align:LEFT;">'
+              || TO_CHAR(v_mo_date, 'MON-YYYY')
+              || '</th>');
+    END LOOP;
+
+    htp.p('</tr></thead>');
+
+    -- ── TBODY: data rows ─────────────────────────────────────────────────────
+    htp.p('<tbody>');
+
+    IF v_omax > 0 THEN
+        FOR oi IN 0 .. v_omax - 1 LOOP
+            htp.p('<tr>');
+            htp.p('<td class="name-col">' || a_name(oi) || '</td>');
+            htp.p('<td class="number-col">' || TO_CHAR(NVL(a_total(oi), 0), '999,999,990') || '</td>');
+
+            -- FOR loop: one <td> per month per officer in REVERSE ORDER
+            FOR mi IN REVERSE 0 .. v_mo_count - 1 LOOP
+                htp.p('<td class="number-col">'  /* Added class for right alignment */
+                      || CASE WHEN NVL(a_bags(oi * 200 + mi), 0) = 0
+                              THEN '&ndash;'
+                              ELSE TO_CHAR(a_bags(oi * 200 + mi), '999,999,990')
+                         END
+                      || '</td>');
+            END LOOP;
+
+            htp.p('</tr>');
+        END LOOP;
+    ELSE
+        htp.p('<tr><td colspan="' || (v_mo_count + 2) || '">No data found.</td></tr>');
+    END IF;
+
+    -- ── TFOOT: TOTAL row (mirrors UNION ALL block) ───────────────────────────
+    htp.p('</tbody><tfoot>');
+    htp.p('<tr class="total-row">');
+    htp.p('<td class="name-col"><strong>TOTAL</strong></td>');
+    htp.p('<td class="number-col"><strong>' || TO_CHAR(v_gtot, '999,999,990') || '</strong></td>');
+
+    -- FOR loop: monthly grand totals in REVERSE ORDER
+    FOR mi IN REVERSE 0 .. v_mo_count - 1 LOOP
+        htp.p('<td class="number-col"><strong>'  /* Added class for right alignment */
+              || TO_CHAR(NVL(a_motot(mi), 0), '999,999,990')
+              || '</strong></td>');
+    END LOOP;
+
+    htp.p('</tr>');
+    htp.p('</tfoot></table>');
+    htp.p('</div>');
+END;
