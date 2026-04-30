@@ -1,0 +1,150 @@
+DECLARE
+    v_sql          CLOB;
+    v_start_month  VARCHAR2(2) := '07';  -- July
+    v_start_year   VARCHAR2(4) := '2025';
+    v_start_date   DATE;
+    v_end_date     DATE;
+    v_current_date DATE;
+    v_month_count  NUMBER;
+BEGIN
+    v_start_date := TO_DATE('01-' || v_start_month || '-' || v_start_year, 'DD-MM-YYYY');
+    v_end_date   := TRUNC(LAST_DAY(SYSDATE));
+
+    v_month_count := MONTHS_BETWEEN(TRUNC(v_end_date, 'MM'), TRUNC(v_start_date, 'MM')) + 1;
+
+    DBMS_LOB.CREATETEMPORARY(v_sql, TRUE);
+
+    ------------------------------------------------------------------
+    -- MAIN QUERY (PRODUCT WISE)
+    ------------------------------------------------------------------
+    DBMS_LOB.APPEND(v_sql, '
+    WITH USER_APPROVAL AS(
+        SELECT APP_IDS APP_ID
+        FROM AB_USER_ACTION_APPROVAL
+        WHERE APP_TYPE=''820''
+          AND STATUS=''Y''
+          AND APPROVAL_STATUS = ''APPROVED''
+    ),
+    CATEGORY_NAMES AS (
+            SELECT
+                   distinct LOOKUP_DET_NAME AS CATEGORY_NAME , 
+                     DET_ID 
+        FROM  
+                      AB_LOOKUP_DETAIL
+                      
+        WHERE 
+              STATUS=''Y''
+              AND MAST_ID=1
+             ORDER BY
+                       DET_ID ASC
+     ),
+    SHIPMENT_DATA AS (
+        SELECT
+            C.ITEM_ID,
+            C.PRODUCT_NAME,
+            NVL(C.NO_BAGS,0) NO_BAGS,
+            TRUNC(NVL(C.SHIPMENT_DATE, C.ADD_DATE), ''MM'') SHIP_MONTH,
+            C.STATUS,
+           CN.CATEGORY_NAME
+        FROM TABLE(AB_SALE_ORDER_PKG.SALE_ORDER_SHIPMENT(:GV_ORG_ID)) C
+        JOIN USER_APPROVAL UA ON UA.APP_ID = C.SHIPMENT_IDD
+        JOIN AB_ITEMS_MASTER ITMS ON ITMS.ITEM_ID = C.ITEM_ID     
+        JOIN CATEGORY_NAMES CN ON CN.DET_ID = ITMS.PRODUCT_CATEGORY_ID
+        
+        WHERE TRUNC(NVL(C.SHIPMENT_DATE, C.ADD_DATE)) BETWEEN DATE ''' || TO_CHAR(v_start_date,'YYYY-MM-DD') || '''
+                                                          AND DATE ''' || TO_CHAR(v_end_date,'YYYY-MM-DD') || '''
+        
+    )
+    SELECT
+        ITEM_ID,
+        PRODUCT_NAME,
+        CATEGORY_NAME,
+        TO_CHAR(NVL(SUM(NO_BAGS), 0), ''999,999,999,999,990'') AS TOTAL_BAGS'
+    );
+
+    ------------------------------------------------------------------
+    -- MONTH LOOP (Dynamic Columns)
+    ------------------------------------------------------------------
+    FOR i IN REVERSE 0 .. v_month_count-1 LOOP
+        v_current_date := ADD_MONTHS(v_start_date, i);
+
+        DBMS_LOB.APPEND(v_sql, ',
+        NVL(TO_CHAR(
+            SUM(
+                CASE 
+                    WHEN SHIP_MONTH = DATE ''' || TO_CHAR(v_current_date,'YYYY-MM-DD') || '''
+                    THEN NO_BAGS 
+                END
+            ),
+            ''999,999,999,999,990''
+        ),0) AS ' || UPPER(TO_CHAR(v_current_date, 'MON_YYYY')));
+    END LOOP;
+
+    ------------------------------------------------------------------
+    -- FROM + GROUP BY
+    ------------------------------------------------------------------
+    DBMS_LOB.APPEND(v_sql, '
+    FROM SHIPMENT_DATA
+    WHERE 
+      (ITEM_ID IN ( SELECT REGEXP_SUBSTR(:P1171_ITEM_NAME, ''[^:]+'', 1, LEVEL) FROM dual 
+   CONNECT BY REGEXP_SUBSTR(:P1171_ITEM_NAME, ''[^:]+'', 1, LEVEL) IS NOT NULL ) OR :P1171_ITEM_NAME IS NULL) 
+    
+ AND (
+    :P1171_BAGS_TYPE IS NULL
+    OR UPPER(TRIM(STATUS)) IN (
+        SELECT UPPER(TRIM(REGEXP_SUBSTR(:P1171_BAGS_TYPE, ''[^:]+'', 1, LEVEL)))
+        FROM dual
+        CONNECT BY REGEXP_SUBSTR(:P1171_BAGS_TYPE, ''[^:]+'', 1, LEVEL) IS NOT NULL
+    )
+)
+    GROUP BY ITEM_ID, PRODUCT_NAME , CATEGORY_NAME
+
+    UNION ALL
+
+    ------------------------------------------------------------------
+    -- TOTAL ROW
+    ------------------------------------------------------------------
+    SELECT
+        NULL AS ITEM_ID,
+        NULL AS CATEGORY_NAME,
+        ''TOTAL'' AS PRODUCT_NAME,
+        ''<strong>'' || TO_CHAR(NVL(SUM(NO_BAGS),0), ''999,999,999,999,990'') || ''</strong>'''
+    );
+
+    ------------------------------------------------------------------
+    -- TOTAL MONTH LOOP
+    ------------------------------------------------------------------
+    FOR i IN REVERSE 0 .. v_month_count-1 LOOP
+        v_current_date := ADD_MONTHS(v_start_date, i);
+
+        DBMS_LOB.APPEND(v_sql, ',
+        ''<strong>'' || NVL(TO_CHAR(
+            SUM(
+                CASE 
+                    WHEN SHIP_MONTH = DATE ''' || TO_CHAR(v_current_date,'YYYY-MM-DD') || '''
+                    THEN NO_BAGS 
+                END
+            ),
+            ''999,999,999,999,990''
+        ),0) || ''</strong>'' AS ' || UPPER(TO_CHAR(v_current_date, 'MON_YYYY')));
+    END LOOP;
+
+    DBMS_LOB.APPEND(v_sql, '
+    FROM SHIPMENT_DATA
+     WHERE     
+       (ITEM_ID IN ( SELECT REGEXP_SUBSTR(:P1171_ITEM_NAME, ''[^:]+'', 1, LEVEL) FROM dual 
+   CONNECT BY REGEXP_SUBSTR(:P1171_ITEM_NAME, ''[^:]+'', 1, LEVEL) IS NOT NULL ) OR :P1171_ITEM_NAME IS NULL) 
+    AND (
+    :P1171_BAGS_TYPE IS NULL
+    OR UPPER(TRIM(STATUS)) IN (
+        SELECT UPPER(TRIM(REGEXP_SUBSTR(:P1171_BAGS_TYPE, ''[^:]+'', 1, LEVEL)))
+        FROM dual
+        CONNECT BY REGEXP_SUBSTR(:P1171_BAGS_TYPE, ''[^:]+'', 1, LEVEL) IS NOT NULL
+    )
+)
+
+    
+    ');
+
+    RETURN v_sql;
+END;
