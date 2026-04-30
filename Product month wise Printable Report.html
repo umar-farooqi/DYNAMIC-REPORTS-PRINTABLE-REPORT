@@ -1,0 +1,241 @@
+DECLARE
+    v_start_date  DATE        := DATE '2025-07-01';
+    v_end_date    DATE        := TRUNC(LAST_DAY(SYSDATE));
+    v_mo_count    PLS_INTEGER;
+    v_mo_date     DATE;
+    v_pi          PLS_INTEGER;
+    v_pmax        PLS_INTEGER := 0;
+    v_gtot        NUMBER      := 0;
+    V_BAGS_TYPE   VARCHAR2(100);
+    V_ITEM_NAME   VARCHAR2(100);
+    v_mi          VARCHAR2(10000);
+
+    -- Simple typed arrays
+    TYPE arr_vc  IS TABLE OF VARCHAR2(500) INDEX BY PLS_INTEGER;
+    TYPE arr_num IS TABLE OF NUMBER        INDEX BY PLS_INTEGER;
+
+    a_pid     arr_vc;   -- product ID
+    a_pname   arr_vc;   -- product name
+    a_ptotal  arr_num;  -- product grand total
+    -- Flat bag matrix: product_idx * 200 + month_idx
+    a_bags    arr_num;
+    a_motot   arr_num;  -- monthly grand totals
+
+BEGIN
+    -- Get product name for selected item
+    BEGIN
+        SELECT LISTAGG(
+            ITM.ITEM_NAME || ' ' || ITM.PACKING_SIZE || '('|| ITM.UNIT ||') '|| ITM.PACKING, 
+            ', '
+        ) WITHIN GROUP (ORDER BY ITM.ITEM_ID)
+        INTO V_ITEM_NAME
+        FROM AB_ITEMS_MASTER ITM
+        WHERE ITM.ITEM_ID IN (
+            SELECT REGEXP_SUBSTR(:P1171_ITEM_NAME, '[^:]+', 1, LEVEL)
+            FROM dual
+            CONNECT BY REGEXP_SUBSTR(:P1171_ITEM_NAME, '[^:]+', 1, LEVEL) IS NOT NULL
+        );
+        EXCEPTION WHEN NO_DATA_FOUND THEN V_ITEM_NAME := 'All Products';
+    END;
+
+    -- Determine bags type
+    IF :P1171_BAGS_TYPE IS NULL THEN
+        V_BAGS_TYPE := 'All Types';
+    ELSIF INSTR(:P1171_BAGS_TYPE, 'Normal Sale Order') > 0 AND INSTR(:P1171_BAGS_TYPE, 'Advance Sale Order') > 0 THEN
+        V_BAGS_TYPE := 'Normal Sale Order & Advance Sale Order';
+    
+    ELSIF :P1171_BAGS_TYPE = 'Normal Sale Order' THEN
+        V_BAGS_TYPE := 'Normal Sale Order';
+    ELSIF :P1171_BAGS_TYPE = 'Advance Sale Order' THEN
+        V_BAGS_TYPE := 'Advance Sale Order';
+    
+    ELSE
+        V_BAGS_TYPE := 'All Types';
+    END IF;
+
+    v_mo_count := MONTHS_BETWEEN(
+                      TRUNC(v_end_date,   'MM'),
+                      TRUNC(v_start_date, 'MM')
+                  ) + 1;
+
+    -- Initialize monthly grand-total slots
+    FOR i IN 0 .. v_mo_count - 1 LOOP
+        a_motot(i) := 0;
+    END LOOP;
+
+    -- Single query: one row per (product, month)
+    FOR r IN (
+        WITH USER_APPROVAL AS(
+            SELECT APP_IDS APP_ID
+            FROM AB_USER_ACTION_APPROVAL
+            WHERE APP_TYPE = '820'
+              AND STATUS = 'Y'
+              AND APPROVAL_STATUS = 'APPROVED'
+        ),
+        SHIPMENT_DATA AS (
+            SELECT
+                C.ITEM_ID,
+                C.PRODUCT_NAME,
+                NVL(C.NO_BAGS, 0) NO_BAGS,
+                TRUNC(NVL(C.SHIPMENT_DATE, C.ADD_DATE), 'MM') SHIP_MONTH,
+                STATUS
+            FROM TABLE(AB_SALE_ORDER_PKG.SALE_ORDER_SHIPMENT(:GV_ORG_ID)) C
+            JOIN USER_APPROVAL UA ON UA.APP_ID = C.SHIPMENT_IDD
+            WHERE TRUNC(NVL(C.SHIPMENT_DATE, C.ADD_DATE)) BETWEEN v_start_date AND v_end_date
+        )
+        SELECT 
+            ITEM_ID,
+            PRODUCT_NAME,
+            MONTHS_BETWEEN(
+                TRUNC(SHIP_MONTH, 'MM'),
+                TRUNC(v_start_date, 'MM')
+            ) m_idx,
+            SUM(NO_BAGS) bags
+        FROM SHIPMENT_DATA
+        WHERE 
+          (ITEM_ID IN (
+               SELECT REGEXP_SUBSTR(:P1171_ITEM_NAME, '[^:]+', 1, LEVEL)
+               FROM dual
+               CONNECT BY REGEXP_SUBSTR(:P1171_ITEM_NAME, '[^:]+', 1, LEVEL) IS NOT NULL
+           ) OR :P1171_ITEM_NAME IS NULL)
+        AND (
+            :P1171_BAGS_TYPE IS NULL
+            OR UPPER(TRIM(STATUS)) IN (
+                SELECT UPPER(TRIM(REGEXP_SUBSTR(:P1171_BAGS_TYPE, '[^:]+', 1, LEVEL)))
+                FROM dual
+                CONNECT BY REGEXP_SUBSTR(:P1171_BAGS_TYPE, '[^:]+', 1, LEVEL) IS NOT NULL
+            )
+        )
+        GROUP BY ITEM_ID, PRODUCT_NAME, SHIP_MONTH
+        ORDER BY PRODUCT_NAME
+    ) LOOP
+        v_mi := r.m_idx;
+
+        -- Find existing product slot, or create new one
+        v_pi := NULL;
+        IF a_pid.COUNT > 0 THEN
+            FOR k IN a_pid.FIRST .. a_pid.LAST LOOP
+                IF a_pid(k) = r.ITEM_ID THEN v_pi := k; EXIT; END IF;
+            END LOOP;
+        END IF;
+
+        IF v_pi IS NULL THEN
+            v_pi         := v_pmax;
+            a_pid(v_pi)  := r.ITEM_ID;
+            a_pname(v_pi) := r.PRODUCT_NAME;
+            a_ptotal(v_pi):= 0;
+            -- Pre-init all month cells for this product
+            FOR m IN 0 .. v_mo_count - 1 LOOP
+                a_bags(v_pi * 200 + m) := 0;
+            END LOOP;
+            v_pmax := v_pmax + 1;
+        END IF;
+
+        a_bags(v_pi * 200 + v_mi) := r.bags;
+        a_ptotal(v_pi) := NVL(a_ptotal(v_pi), 0) + r.bags;
+        a_motot(v_mi) := NVL(a_motot(v_mi), 0) + r.bags;
+        v_gtot        := v_gtot + r.bags;
+    END LOOP;
+
+    -- Print JavaScript for print functionality
+    htp.p('<script>
+        function printDiv(printpage) {
+            var headstr  = "<html><head><title></title><style>";
+            headstr += "@page { size: legal landscape; margin: 10mm; }";
+            headstr += "td, H4 { -webkit-print-color-adjust: exact !important; print-color-adjust: exact !important; }";
+            headstr += "body  { margin: 0; padding: 0; font-family: Arial, sans-serif; }";
+            headstr += "thead { display: table-header-group; }";
+            headstr += "tfoot { display: table-footer-group; }";
+            headstr += "table { border-collapse: collapse; width: 100%; table-layout: fixed; }";
+            headstr += "th, td { font-size: 11px; text-align: center; border: 1px solid #999; padding: 3px; word-wrap: break-word; }";
+            headstr += "th { background-color: #B4C6E7; -webkit-print-color-adjust: exact; print-color-adjust: exact; }";
+            headstr += "td.name-col { text-align: left; }";
+            headstr += "td.number-col { text-align: right; }";
+            headstr += "tr.total-row td { background-color: #E2EFDA; font-weight: bold; -webkit-print-color-adjust: exact; print-color-adjust: exact; }";
+            headstr += "h3 { color: white; margin: 0; text-align: center; background-color: #1F3864; border: 1px solid black; -webkit-print-color-adjust: exact; print-color-adjust: exact; padding: 5px; }";
+            headstr += "</style></head><body>";
+            var footstr = "</body></html>";
+            var newstr  = document.getElementById(printpage).innerHTML;
+            document.body.innerHTML = headstr + newstr + footstr;
+            window.print();
+            location.reload();
+        }
+    </script>');
+
+    htp.p('<button class="button" onclick="printDiv(''all_reports'')">Print Report</button>');
+
+    -- Report container
+    htp.p('<div id="all_reports">');
+    htp.p('<h3>Product Sales Bags Report &mdash; '
+          || TO_CHAR(v_start_date, 'MON-YYYY')
+          || ' to '
+          || TO_CHAR(v_end_date, 'MON-YYYY')
+          || '</h3>');
+
+    htp.p('<div style="font-family: Arial, sans-serif; font-size: 13px; padding: 6px; display: flex; justify-content: space-between; align-items: center; width: 100%;">
+          <span style="text-align: left;"><b>Bag Type:</b> ' || V_BAGS_TYPE || '</span>
+          
+          <span style="text-align: right; margin-right: 40px;"><b>Print By:</b> '|| :APP_USER ||'</span>
+       </div>');
+
+    htp.p('<table border="1" cellpadding="3" cellspacing="0">');
+
+    -- THEAD
+    htp.p('<thead><tr>');
+    htp.p('<th style="background:#1F3864;color:white;text-align:LEFT;">PRODUCT</th>');
+    htp.p('<th style="background:#1F3864;color:white;">TOTAL BAGS</th>');
+
+    -- Month columns in REVERSE order
+    FOR i IN REVERSE 0 .. v_mo_count - 1 LOOP
+        v_mo_date := ADD_MONTHS(v_start_date, i);
+        htp.p('<th style="background:#1F3864;color:white;text-align:LEFT;">'
+              || TO_CHAR(v_mo_date, 'MON-YYYY')
+              || '</th>');
+    END LOOP;
+
+    htp.p('</tr></thead>');
+
+    -- TBODY: data rows (NO FOOTER HERE)
+    htp.p('<tbody>');
+
+    IF v_pmax > 0 THEN
+        FOR pi IN 0 .. v_pmax - 1 LOOP
+            htp.p('<tr>');
+            htp.p('<td class="name-col">' || a_pname(pi) || '</td>');
+            htp.p('<td class="number-col">' || TO_CHAR(NVL(a_ptotal(pi), 0), '999,999,990') || '</td>');
+
+            -- Monthly data for this product in REVERSE order
+            FOR mi IN REVERSE 0 .. v_mo_count - 1 LOOP
+                htp.p('<td class="number-col">'
+                      || CASE WHEN NVL(a_bags(pi * 200 + mi), 0) = 0
+                              THEN '&ndash;'
+                              ELSE TO_CHAR(a_bags(pi * 200 + mi), '999,999,990')
+                         END
+                      || '</td>');
+            END LOOP;
+
+            htp.p('</tr>');
+        END LOOP;
+    ELSE
+        htp.p('<tr><td colspan="' || (v_mo_count + 2) || '">No data found.</td></tr>');
+    END IF;
+
+    htp.p('</tbody>'); 
+
+    -- NOW ADD TOTAL ROW OUTSIDE OF FOOTER
+    htp.p('<tr class="total-row">');
+    htp.p('<td class="name-col"><strong>TOTAL</strong></td>');
+    htp.p('<td class="number-col"><strong>' || TO_CHAR(v_gtot, '999,999,990') || '</strong></td>');
+
+    -- Monthly totals in REVERSE order
+    FOR mi IN REVERSE 0 .. v_mo_count - 1 LOOP
+        htp.p('<td class="number-col"><strong>'
+              || TO_CHAR(NVL(a_motot(mi), 0), '999,999,990')
+              || '</strong></td>');
+    END LOOP;
+
+    htp.p('</tr>'); 
+
+    htp.p('</table>'); 
+    htp.p('</div>'); 
+END;
